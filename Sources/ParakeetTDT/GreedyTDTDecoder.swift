@@ -30,7 +30,10 @@ public enum GreedyTDTDecoder {
     public static func decode(
         encoderHidden: MLMultiArray,
         encoderMask: MLMultiArray,
-        runner: ModelRunner
+        worker: DecoderWorker,
+        blankTokenId: Int,
+        durations: [Int],
+        maxSymbolsPerStep: Int
     ) throws -> Output {
         guard encoderHidden.shape.count == 3 else {
             throw ParakeetError.unexpectedOutputShape(
@@ -51,17 +54,16 @@ public enum GreedyTDTDecoder {
         }
         validFrames = min(validFrames, tMax)
 
-        let blank = runner.blankTokenId
-        let durations = runner.durations
-        let maxSym = runner.maxSymbolsPerStep
+        let blank = blankTokenId
+        let maxSym = maxSymbolsPerStep
 
-        // Persistent buffers owned by the runner. Zero hidden/cell for a
+        // Persistent buffers owned by the worker. Zero hidden/cell for a
         // fresh utterance; input_ids starts at blank.
-        let hidden = runner.decoderHidden
-        let cell = runner.decoderCell
-        let inputIds = runner.decoderInputIds
-        let jointEncFrame = runner.jointEncoderFrame
-        let jointDecState = runner.jointDecoderState
+        let hidden = worker.hidden
+        let cell = worker.cell
+        let inputIds = worker.inputIds
+        let jointEncFrame = worker.encoderFrame
+        let jointDecState = worker.decoderState
         zero(hidden)
         zero(cell)
         let idsPtr = inputIds.dataPointer
@@ -102,7 +104,7 @@ public enum GreedyTDTDecoder {
                     // Scoped so the prediction output (IOSurface-backed on
                     // ANE / GPU) is released before the next iteration.
                     try autoreleasepool {
-                        let out = try runner.runDecoderStep()
+                        let out = try worker.runDecoderStep()
                         let decShape = out.decoderHidden.shape.map(\.intValue)
                         let decU = decShape.count >= 3
                             ? decShape[decShape.count - 2] : 1
@@ -124,7 +126,7 @@ public enum GreedyTDTDecoder {
                 // Joint: also autoreleasepool'd so the IOSurface output is
                 // returned to the pool before we loop.
                 let (tokenId, durIdx): (Int, Int) = try autoreleasepool {
-                    let jointOut = try runner.runJoint()
+                    let jointOut = try worker.runJoint()
                     return (
                         argmax(jointOut.tokenLogits),
                         argmax(jointOut.durationLogits)

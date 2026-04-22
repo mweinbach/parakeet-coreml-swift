@@ -38,13 +38,20 @@ public final class ParakeetTranscriber {
     /// in the cache. Use `deleteSourceAfterCompile: true` to drop the raw
     /// `.mlpackage` from disk once compilation succeeds (halves peak disk
     /// usage on space-constrained devices).
+    ///
+    /// ``decoderWorkers`` controls how many parallel decode-loop threads
+    /// the pipeline uses. ``nil`` (the default) picks 2 for ANE / GPU / all
+    /// and 1 for CPU-only (because on CPU the encoder contends with the
+    /// decode workers on the same cores). Higher values can help GPU
+    /// further if decode is the bottleneck.
     public init(
         modelsRoot: URL,
         computeUnits: ParakeetComputeUnits = .ane,
         chunkMelFrames: Int = 3000,
         sampleRate: Int = 16_000,
         deleteSourceAfterCompile: Bool = false,
-        cacheDirectory: URL? = nil
+        cacheDirectory: URL? = nil,
+        decoderWorkers: Int? = nil
     ) throws {
         self.computeUnits = computeUnits
         self.chunkMelFrames = chunkMelFrames
@@ -84,6 +91,21 @@ public final class ParakeetTranscriber {
             from: decoder
         )
 
+        // Per-target worker defaults tuned on M-class silicon. Measured
+        // scaling on `test_audio.mp3` (see README):
+        //   - CPU:  1 worker  (2+ contends with the on-CPU encoder)
+        //   - ANE:  2 workers (encoder-bound; more doesn't help)
+        //   - GPU:  4 workers (diminishing returns past 4)
+        //   - all:  4 workers (assume GPU involved)
+        let workerCount: Int = {
+            if let override = decoderWorkers { return max(1, override) }
+            switch computeUnits {
+            case .cpu: return 1
+            case .ane: return 2
+            case .gpu, .all: return 4
+            }
+        }()
+
         self.runner = try ModelRunner(
             encoder: encoder,
             decoder: decoder,
@@ -96,7 +118,8 @@ public final class ParakeetTranscriber {
             blankTokenId: 8192,
             durations: [0, 1, 2, 3, 4],
             vocabSize: 8193,
-            maxSymbolsPerStep: 10
+            maxSymbolsPerStep: 10,
+            numDecoderWorkers: workerCount
         )
         self.tokenizer = try Tokenizer(tokenizerJSONURL: tokenizerURL)
         self.featureExtractor = try MelFeatureExtractor(

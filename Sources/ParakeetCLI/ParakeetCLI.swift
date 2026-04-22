@@ -53,6 +53,12 @@ struct Transcribe: ParsableCommand {
     )
     var maxSeconds: Double? = nil
 
+    @Option(
+        name: .customLong("decoder-workers"),
+        help: "Parallel decode-loop workers. Default: 2 for ANE / GPU / all, 1 for CPU (avoids CPU core contention with the on-CPU encoder)."
+    )
+    var decoderWorkers: Int? = nil
+
     func validate() throws {
         guard ["ane", "gpu", "cpu", "all"].contains(computeUnits) else {
             throw ValidationError(
@@ -81,7 +87,8 @@ struct Transcribe: ParsableCommand {
         let transcriber = try ParakeetTranscriber(
             modelsRoot: modelsURL,
             computeUnits: units,
-            deleteSourceAfterCompile: deleteSourceAfterCompile
+            deleteSourceAfterCompile: deleteSourceAfterCompile,
+            decoderWorkers: decoderWorkers
         )
         let loadSecs = Date().timeIntervalSince(loadStart)
         FileHandle.standardError.write(Data(

@@ -1,12 +1,15 @@
 import CoreML
 import Foundation
 
-/// Typed wrappers around the three converted Parakeet submodules.
+/// Top-level container for the three Parakeet submodules plus a pool of
+/// :class:`DecoderWorker` instances for parallel decoding.
 ///
-/// All input `MLMultiArray`s are allocated exactly once and reused across
-/// every prediction call. The ``MLFeatureProvider``s handed to Core ML are
-/// also cached (see ``FeatureBag``) so each decode step costs one
-/// ``MLModel.prediction(from:)`` call and nothing else on the Swift side.
+/// The encoder has a single set of reusable input buffers (we only have
+/// one encoder running at a time -- it's driven by the pipeline's
+/// serial stage-2 queue). The decoder + joint each have N workers, one
+/// per concurrent decode thread; the pipeline's stage-3 worker pool
+/// borrows / returns workers from this pool via ``acquireWorker`` /
+/// ``releaseWorker``.
 public final class ModelRunner {
     private let encoder: MLModel
     private let decoder: MLModel
@@ -26,27 +29,20 @@ public final class ModelRunner {
     public let vocabSize: Int
     public let maxSymbolsPerStep: Int
 
-    // MARK: - Persistent input buffers
+    // MARK: - Encoder inputs (single-instance)
 
-    /// Encoder inputs. Reused across chunks.
     public let encoderFeatures: MLMultiArray
     public let encoderMask: MLMultiArray
     let encoderInputs: FeatureBag
-
-    /// Decoder inputs. Reused across every step of the greedy decode.
-    public let decoderInputIds: MLMultiArray
-    public let decoderHidden: MLMultiArray
-    public let decoderCell: MLMultiArray
-    let decoderInputs: FeatureBag
-
-    /// Joint inputs. Reused across every step.
-    public let jointEncoderFrame: MLMultiArray
-    public let jointDecoderState: MLMultiArray
-    let jointInputs: FeatureBag
-
-    /// Prediction options shared by every submodule. Intentionally empty
-    /// (default config); kept around so we can flip knobs in one place.
     let predictionOptions = MLPredictionOptions()
+
+    // MARK: - Decoder worker pool
+
+    public let decoderWorkers: [DecoderWorker]
+
+    /// Underlying pool: consumers take a worker to run one chunk's decode
+    /// loop, then return it.
+    private let workerPool: BlockingWorkerPool
 
     public init(
         encoder: MLModel,
@@ -58,7 +54,8 @@ public final class ModelRunner {
         blankTokenId: Int,
         durations: [Int],
         vocabSize: Int,
-        maxSymbolsPerStep: Int
+        maxSymbolsPerStep: Int,
+        numDecoderWorkers: Int = 2
     ) throws {
         self.encoder = encoder
         self.decoder = decoder
@@ -89,41 +86,22 @@ public final class ModelRunner {
             "attention_mask": MLFeatureValue(multiArray: encoderMask),
         ])
 
-        // --- Decoder inputs ---
-        self.decoderInputIds = try MLMultiArray(shape: [1, 1], dataType: .int32)
-        self.decoderHidden = try MLMultiArray(
-            shape: [
-                NSNumber(value: decoderHiddenLayers), 1,
-                NSNumber(value: decoderHiddenSize),
-            ],
-            dataType: .float32
-        )
-        self.decoderCell = try MLMultiArray(
-            shape: [
-                NSNumber(value: decoderHiddenLayers), 1,
-                NSNumber(value: decoderHiddenSize),
-            ],
-            dataType: .float32
-        )
-        self.decoderInputs = FeatureBag([
-            "input_ids": MLFeatureValue(multiArray: decoderInputIds),
-            "hidden": MLFeatureValue(multiArray: decoderHidden),
-            "cell": MLFeatureValue(multiArray: decoderCell),
-        ])
-
-        // --- Joint inputs ---
-        self.jointEncoderFrame = try MLMultiArray(
-            shape: [1, NSNumber(value: decoderHiddenSize)],
-            dataType: .float32
-        )
-        self.jointDecoderState = try MLMultiArray(
-            shape: [1, NSNumber(value: decoderHiddenSize)],
-            dataType: .float32
-        )
-        self.jointInputs = FeatureBag([
-            "encoder_frame": MLFeatureValue(multiArray: jointEncoderFrame),
-            "decoder_state": MLFeatureValue(multiArray: jointDecoderState),
-        ])
+        // --- Decoder worker pool ---
+        let workerCount = max(1, numDecoderWorkers)
+        var workers = [DecoderWorker]()
+        workers.reserveCapacity(workerCount)
+        for _ in 0..<workerCount {
+            workers.append(
+                try DecoderWorker(
+                    decoder: decoder,
+                    joint: joint,
+                    decoderHiddenLayers: decoderHiddenLayers,
+                    decoderHiddenSize: decoderHiddenSize
+                )
+            )
+        }
+        self.decoderWorkers = workers
+        self.workerPool = BlockingWorkerPool(workers: workers)
     }
 
     // MARK: - Encoder
@@ -168,43 +146,50 @@ public final class ModelRunner {
         return (hidden, outMask)
     }
 
-    // MARK: - Decoder (one step)
+    // MARK: - Decoder worker pool
 
-    /// The caller has already written the desired input_ids / hidden /
-    /// cell values into the persistent buffers. We just dispatch the
-    /// prediction and unpack the three outputs.
-    public func runDecoderStep() throws -> (
-        decoderHidden: MLMultiArray,
-        nextHidden: MLMultiArray,
-        nextCell: MLMultiArray
-    ) {
-        let out = try decoder.prediction(
-            from: decoderInputs, options: predictionOptions
-        )
-        guard let dh = out.featureValue(for: "decoder_hidden")?.multiArrayValue
-        else { throw ParakeetError.missingOutput(name: "decoder_hidden") }
-        guard let nh = out.featureValue(for: "next_hidden")?.multiArrayValue
-        else { throw ParakeetError.missingOutput(name: "next_hidden") }
-        guard let nc = out.featureValue(for: "next_cell")?.multiArrayValue
-        else { throw ParakeetError.missingOutput(name: "next_cell") }
-        return (dh, nh, nc)
+    /// Acquire (blocking) a decoder worker. Returns nil if the pool has
+    /// been shut down. Release with ``releaseWorker`` when the decode
+    /// loop for a chunk finishes.
+    public func acquireWorker() -> DecoderWorker? {
+        workerPool.acquire()
     }
 
-    // MARK: - Joint
+    public func releaseWorker(_ worker: DecoderWorker) {
+        workerPool.release(worker)
+    }
+}
 
-    /// As with ``runDecoderStep``, the caller writes the input buffers
-    /// directly.
-    public func runJoint() throws -> (
-        tokenLogits: MLMultiArray,
-        durationLogits: MLMultiArray
-    ) {
-        let out = try joint.prediction(
-            from: jointInputs, options: predictionOptions
-        )
-        guard let tl = out.featureValue(for: "token_logits")?.multiArrayValue
-        else { throw ParakeetError.missingOutput(name: "token_logits") }
-        guard let dl = out.featureValue(for: "duration_logits")?.multiArrayValue
-        else { throw ParakeetError.missingOutput(name: "duration_logits") }
-        return (tl, dl)
+/// Fixed-size pool with blocking acquire semantics. Straight `NSLock` +
+/// `DispatchSemaphore`, no `async` required.
+final class BlockingWorkerPool: @unchecked Sendable {
+    private var available: [DecoderWorker]
+    private let lock = NSLock()
+    private let semaphore: DispatchSemaphore
+    private var closed = false
+
+    init(workers: [DecoderWorker]) {
+        available = workers
+        semaphore = DispatchSemaphore(value: workers.count)
+    }
+
+    func acquire() -> DecoderWorker? {
+        semaphore.wait()
+        lock.lock()
+        if closed || available.isEmpty {
+            lock.unlock()
+            semaphore.signal()
+            return nil
+        }
+        let w = available.removeLast()
+        lock.unlock()
+        return w
+    }
+
+    func release(_ worker: DecoderWorker) {
+        lock.lock()
+        available.append(worker)
+        lock.unlock()
+        semaphore.signal()
     }
 }

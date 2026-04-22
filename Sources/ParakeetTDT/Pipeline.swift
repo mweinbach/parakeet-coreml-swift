@@ -2,19 +2,20 @@ import CoreML
 import Dispatch
 import Foundation
 
-/// 3-stage pipeline for long-form transcription: mel -> encoder -> decode.
+/// Pipelined long-form transcription.
 ///
-/// The three stages hit different hardware (CPU / ANE-or-GPU / CPU), so
-/// running them sequentially per chunk is leaving money on the table --
-/// the encoder is idle while we extract the next mel, the CPU cores are
-/// idle while we wait for the encoder. Pipelining collapses that to
-/// ``max(stage_times) * num_chunks`` instead of ``sum(stage_times) *
-/// num_chunks``.
+/// Three stages connected by bounded blocking queues:
 ///
-/// Two bounded queues (``BlockingQueue``) sit between the stages and
-/// provide backpressure so we never hold more than a few IOSurfaces
-/// in-flight at once -- important because Core ML's ANE output buffers
-/// come out of a pool with limited capacity.
+/// 1. **mel extraction** (CPU, `vDSP`).
+/// 2. **encoder** (ANE / GPU / CPU depending on ``computeUnits``).
+/// 3. **greedy TDT decode** (CPU, LSTM + joint) -- runs in a worker pool
+///    of N :class:`DecoderWorker`s so the encoder isn't the only thing
+///    waiting on a single CPU decode loop.
+///
+/// With default settings (2 decode workers) the GPU build is
+/// encoder-bound; the ANE build is also encoder-bound; the CPU build is
+/// encoder-bound by a wide margin. In all three cases, wall clock
+/// collapses to roughly ``max(stage_time) * num_chunks``.
 enum Pipeline {
 
     struct Result {
@@ -38,10 +39,10 @@ enum Pipeline {
             )
         }
 
-        // Stage 1 -> Stage 2: mel features + original chunk index.
         let melQueue = BlockingQueue<MelItem>(capacity: 2)
-        // Stage 2 -> Stage 3: encoder outputs.
-        let encQueue = BlockingQueue<EncoderItem>(capacity: 2)
+        let encQueue = BlockingQueue<EncoderItem>(
+            capacity: max(2, runner.decoderWorkers.count + 1)
+        )
 
         let globalError = ErrorSlot()
 
@@ -83,42 +84,74 @@ enum Pipeline {
             encQueue.close()
         }
 
-        // --- Stage 3: CPU decode loop (main thread) ---
-        var tokens = [Int]()
-        var frames = [Int]()
-        var durations = [Int]()
-        var totalFrameOffset = 0
-        var decodeElapsed = 0.0
+        // --- Stage 3: CPU decode worker pool ---
+        let decodeQ = DispatchQueue(
+            label: "parakeet.decode",
+            qos: .userInitiated,
+            attributes: .concurrent
+        )
+        let group = DispatchGroup()
+        let decodeTotal = AtomicDouble()
+        let results = ChunkResultAccumulator()
 
         while let item = encQueue.take() {
             if globalError.hasError { break }
-            do {
-                let decoded = try autoreleasepool {
-                    try GreedyTDTDecoder.decode(
-                        encoderHidden: item.hidden,
-                        encoderMask: item.mask,
-                        runner: runner
-                    )
+            guard let worker = runner.acquireWorker() else { break }
+
+            group.enter()
+            decodeQ.async {
+                defer {
+                    runner.releaseWorker(worker)
+                    group.leave()
                 }
-                decodeElapsed += decoded.elapsedSeconds
-                tokens.append(contentsOf: decoded.tokenIds)
-                frames.append(
-                    contentsOf: decoded.frameIndices.map { $0 + totalFrameOffset }
-                )
-                durations.append(contentsOf: decoded.durations)
-                totalFrameOffset += item.hidden.shape[1].intValue
-            } catch {
-                globalError.set(error)
-                break
+                do {
+                    let decoded = try autoreleasepool {
+                        try GreedyTDTDecoder.decode(
+                            encoderHidden: item.hidden,
+                            encoderMask: item.mask,
+                            worker: worker,
+                            blankTokenId: runner.blankTokenId,
+                            durations: runner.durations,
+                            maxSymbolsPerStep: runner.maxSymbolsPerStep
+                        )
+                    }
+                    decodeTotal.add(decoded.elapsedSeconds)
+                    results.set(
+                        index: item.index,
+                        chunk: ChunkResult(
+                            tokenIds: decoded.tokenIds,
+                            frameIndices: decoded.frameIndices,
+                            durations: decoded.durations,
+                            encoderFrames: item.hidden.shape[1].intValue
+                        )
+                    )
+                } catch {
+                    globalError.set(error)
+                }
             }
         }
 
-        // Drain / signal upstream stages so they can unblock and exit.
+        group.wait()
         melQueue.close()
         encQueue.close()
 
         if let err = globalError.error {
             throw err
+        }
+
+        // Reassemble tokens in chunk order -- the worker pool completes
+        // chunks out of order.
+        var tokens = [Int]()
+        var frames = [Int]()
+        var durations = [Int]()
+        var totalFrameOffset = 0
+        for chunk in results.ordered(count: chunks.count) {
+            tokens.append(contentsOf: chunk.tokenIds)
+            frames.append(
+                contentsOf: chunk.frameIndices.map { $0 + totalFrameOffset }
+            )
+            durations.append(contentsOf: chunk.durations)
+            totalFrameOffset += chunk.encoderFrames
         }
 
         return Result(
@@ -127,7 +160,7 @@ enum Pipeline {
             durations: durations,
             melElapsed: melTotal.value,
             encoderElapsed: encTotal.value,
-            decodeElapsed: decodeElapsed
+            decodeElapsed: decodeTotal.value
         )
     }
 }
@@ -145,10 +178,14 @@ private struct EncoderItem {
     let mask: MLMultiArray
 }
 
-/// Capacity-bounded blocking MPSC queue. Thin wrapper around a Swift array
-/// with two ``DispatchSemaphore``s: one for "slots free" (producer waits
-/// on it when full), one for "items available" (consumer waits on it when
-/// empty). A ``NSLock`` serializes the buffer itself.
+private struct ChunkResult {
+    let tokenIds: [Int]
+    let frameIndices: [Int]
+    let durations: [Int]
+    let encoderFrames: Int
+}
+
+/// Capacity-bounded MPSC blocking queue.
 private final class BlockingQueue<T>: @unchecked Sendable {
     private var buffer: [T] = []
     private var closed = false
@@ -177,9 +214,8 @@ private final class BlockingQueue<T>: @unchecked Sendable {
         itemsAvailable.wait()
         lock.lock()
         if buffer.isEmpty {
-            // Closed and drained.
             lock.unlock()
-            itemsAvailable.signal()  // wake any other waiters so they also exit
+            itemsAvailable.signal()
             return nil
         }
         let value = buffer.removeFirst()
@@ -194,14 +230,36 @@ private final class BlockingQueue<T>: @unchecked Sendable {
         closed = true
         lock.unlock()
         if !wasClosed {
-            // Wake all waiters -- takers find buffer empty + closed and return nil.
             itemsAvailable.signal()
             freeSlots.signal()
         }
     }
 }
 
-/// Simple error slot + lock for cross-thread error propagation.
+/// Chunk results land out of order because the decode worker pool runs
+/// multiple chunks concurrently. This collects them into a dict keyed on
+/// chunk index and hands back an ordered sequence at the end.
+private final class ChunkResultAccumulator: @unchecked Sendable {
+    private var map: [Int: ChunkResult] = [:]
+    private let lock = NSLock()
+
+    func set(index: Int, chunk: ChunkResult) {
+        lock.lock()
+        map[index] = chunk
+        lock.unlock()
+    }
+
+    func ordered(count: Int) -> [ChunkResult] {
+        lock.lock(); defer { lock.unlock() }
+        var out = [ChunkResult]()
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            if let r = map[i] { out.append(r) }
+        }
+        return out
+    }
+}
+
 private final class ErrorSlot: @unchecked Sendable {
     private var _error: Error?
     private let lock = NSLock()
@@ -210,19 +268,16 @@ private final class ErrorSlot: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         return _error
     }
-
     var hasError: Bool {
         lock.lock(); defer { lock.unlock() }
         return _error != nil
     }
-
     func set(_ err: Error) {
         lock.lock(); defer { lock.unlock() }
         if _error == nil { _error = err }
     }
 }
 
-/// Cross-thread float accumulator for timing totals.
 private final class AtomicDouble: @unchecked Sendable {
     private var _value: Double = 0
     private let lock = NSLock()
