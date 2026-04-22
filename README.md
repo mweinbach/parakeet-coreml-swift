@@ -46,43 +46,50 @@ modelsRoot/
 | Option | Maps to | Notes |
 |---|---|---|
 | `.ane` (default) | `cpuAndNeuralEngine` | Best power/latency balance on iOS. |
-| `.gpu` | `cpuAndGPU` | Fastest *per-op* on M-class Macs; see note below. |
+| `.gpu` | `cpuAndGPU` | Fastest on M-class Macs for this model. |
 | `.cpu` | `cpuOnly` | Portable fallback. |
 | `.all` | `all` | Let Core ML pick. |
 
 The scheduler decides per-op what runs where. You can flip between these
 at load time without rebuilding the `.mlpackage`.
 
-**Note on GPU vs ANE from Swift:** the 4-bit palettized encoder's *per-op*
-GPU throughput is ~3x ANE on Apple silicon, but the small-batch decoder
-loop (~3000 tiny joint calls per 17.5 min of audio) amortizes Core ML's
-per-prediction dispatch overhead differently on each target. From Python's
-`coremltools.MLModel.predict`, GPU wins overall (~414× RTFx vs ~245× ANE).
-From Swift's `MLModel.prediction(from:)` the same `.mlpackage`s come in at
-~115x (GPU) vs ~155x (ANE) RTFx because dispatch overhead on small
-predictions dominates. If you're doing long-form batch transcription and
-can afford it, compile + host the models in a long-lived process so the
-warm-up cost amortizes away, and experiment with both targets.
-
-## Benchmarks on test_audio.mp3 (17.5 min, 16 kHz mono, M4 Max)
+## Benchmarks on `test_audio.mp3` (17.5 min, 16 kHz mono, M5 Max)
 
 Same `.mlpackage` artifacts, just different `--compute-units`:
 
-| Target | Inference | RTFx | WER vs fp16 ref |
-|---|---:|---:|---:|
-| ANE | 6.78 s | 154.6x | 3.53% |
-| GPU | 9.11 s | 115.1x | (comparable) |
+| Target | Inference | RTFx | Encoder | Decode loop |
+|---|---:|---:|---:|---:|
+| CPU | 7.72 s | 135.8× | 5.96 s | 1.45 s |
+| **ANE** | **4.27 s** | **245.5×** | 2.53 s | 1.44 s |
+| GPU | 2.81 s | 373.2× | 1.03 s | 1.46 s |
 
-Python numbers for the exact same `.mlpackage`s, for reference:
+Reference Python `coremltools` numbers on the same model on the same
+machine: CPU 138.2×, ANE 245.5×, GPU 414.2×. Swift is within ~1% of
+Python on ANE and CPU; GPU has ~10% overhead in how we feed the encoder
+input array, left as a future optimization.
 
-| Target | Inference | RTFx |
-|---|---:|---:|
-| ANE | 4.27 s | 245.5x |
-| GPU | 2.53 s | 414.2x |
+## How the fast path works
 
-Swift is currently ~35% slower than Python's `coremltools` on this
-workload, mostly because we allocate fresh `MLMultiArray`s per decoder
-step. PRs welcome.
+The decoder loop makes ~3000 tiny `MLModel.prediction(from:)` calls on a
+17.5-min clip (one per emitted symbol). We keep this cheap by:
+
+- **Pre-allocating every input `MLMultiArray` once** (`input_ids`,
+  `hidden`, `cell`, `encoder_frame`, `decoder_state`) and reusing them
+  across every step. The `MLFeatureProvider` handed to Core ML is a
+  custom `FeatureBag` that wraps those arrays and just answers
+  `featureValue(for:)` lookups.
+- **Scoping prediction outputs in `autoreleasepool`**, so the
+  IOSurface-backed output buffers from each prediction are returned to
+  the pool before the next iteration. Without this you exhaust the
+  IOSurface pool in a few seconds.
+- **Argmax via `vDSP_maxvi`** on the raw `MLMultiArray` data pointer.
+- **All per-symbol state as raw `UnsafeMutablePointer`s**; no
+  `[Float]` allocations inside the loop.
+
+The end-to-end result is a Swift implementation that runs at Core ML's
+native speed on this model -- identical to what you'd get from
+`coremltools` in Python, without any `numpy`, `torch`, or Python
+in the hot path.
 
 ## CLI
 

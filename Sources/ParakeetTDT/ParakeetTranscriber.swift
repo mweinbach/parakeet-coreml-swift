@@ -84,7 +84,7 @@ public final class ParakeetTranscriber {
             from: decoder
         )
 
-        self.runner = ModelRunner(
+        self.runner = try ModelRunner(
             encoder: encoder,
             decoder: decoder,
             joint: joint,
@@ -129,6 +129,10 @@ public final class ParakeetTranscriber {
         var frames = [Int]()
         var durations = [Int]()
         var totalFrameOffset = 0
+
+        var melElapsed = 0.0
+        var encoderElapsed = 0.0
+        var decodeElapsed = 0.0
         let start = Date()
 
         var cursor = 0
@@ -140,15 +144,24 @@ public final class ParakeetTranscriber {
                     contentsOf: [Float](repeating: 0, count: chunkSamples - chunk.count)
                 )
             }
+
+            let tMel = Date()
             let features = featureExtractor.extract(from: chunk)
+            melElapsed += Date().timeIntervalSince(tMel)
+
+            let tEnc = Date()
             let (encHidden, encMask) = try runner.runEncoder(
                 features: features.mel, mask: features.attentionMask
             )
+            encoderElapsed += Date().timeIntervalSince(tEnc)
+
             let decoded = try GreedyTDTDecoder.decode(
                 encoderHidden: encHidden,
                 encoderMask: encMask,
                 runner: runner
             )
+            decodeElapsed += decoded.elapsedSeconds
+
             tokens.append(contentsOf: decoded.tokenIds)
             frames.append(contentsOf: decoded.frameIndices.map { $0 + totalFrameOffset })
             durations.append(contentsOf: decoded.durations)
@@ -156,15 +169,24 @@ public final class ParakeetTranscriber {
             cursor += chunkSamples
         }
 
-        let elapsed = Date().timeIntervalSince(start)
+        let tDetok = Date()
         let text = tokenizer.decode(tokens, skipSpecial: true)
+        let detokElapsed = Date().timeIntervalSince(tDetok)
+
+        let elapsed = Date().timeIntervalSince(start)
         return Transcription(
             text: text,
             tokenIds: tokens,
             frameIndices: frames,
             durations: durations,
             audioDurationSeconds: audioDuration,
-            inferenceDurationSeconds: elapsed
+            inferenceDurationSeconds: elapsed,
+            timing: TranscriptionTiming(
+                melExtract: melElapsed,
+                encoder: encoderElapsed,
+                decoderLoop: decodeElapsed,
+                detokenize: detokElapsed
+            )
         )
     }
 

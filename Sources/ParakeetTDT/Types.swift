@@ -24,6 +24,28 @@ public enum ParakeetComputeUnits: String, Sendable {
     }
 }
 
+/// Breakdown of where inference time went, in seconds.
+public struct TranscriptionTiming: Sendable {
+    public var melExtract: Double
+    public var encoder: Double
+    public var decoderLoop: Double   // decoder + joint + argmax combined
+    public var detokenize: Double
+
+    public init(
+        melExtract: Double = 0,
+        encoder: Double = 0,
+        decoderLoop: Double = 0,
+        detokenize: Double = 0
+    ) {
+        self.melExtract = melExtract
+        self.encoder = encoder
+        self.decoderLoop = decoderLoop
+        self.detokenize = detokenize
+    }
+
+    public var total: Double { melExtract + encoder + decoderLoop + detokenize }
+}
+
 /// Result of a successful transcription.
 public struct Transcription: Sendable {
     /// Final detokenized text.
@@ -41,6 +63,8 @@ public struct Transcription: Sendable {
     public let audioDurationSeconds: Double
     /// Wall-clock inference duration (seconds). Excludes model load time.
     public let inferenceDurationSeconds: Double
+    /// Per-phase timing breakdown (sums to ``inferenceDurationSeconds``).
+    public let timing: TranscriptionTiming
     /// `audioDurationSeconds / inferenceDurationSeconds`. Higher is better;
     /// >1 means faster than real time.
     public var rtfx: Double {

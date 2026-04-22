@@ -5,22 +5,26 @@ import Foundation
 /// Greedy TDT (Token-and-Duration Transducer) decoder.
 ///
 /// Ports the Python ``greedy_tdt_decode`` loop line-for-line:
-///   - Maintain two LSTM state tensors (``hidden``, ``cell``) and the last
-///     emitted token.
+///   - Maintain two LSTM state tensors (``hidden``, ``cell``) plus the last
+///     emitted token in a single persistent set of ``MLMultiArray``s owned
+///     by the runner.
 ///   - For each encoder frame ``t``:
-///     - Call decoder once (or reuse cached output if we just emitted blank).
+///     - Call decoder once (or reuse cached ``decoder_hidden`` if we just
+///       emitted blank).
 ///     - Call joint(encoder[t], decoder_state).
 ///     - Argmax over token logits; argmax over duration logits.
-///     - If token is blank: advance t by ``max(duration, 1)``.
-///     - Otherwise: emit token, advance t by duration if > 0, else keep t
-///       and try again, capped by ``maxSymbolsPerStep`` to avoid infinite
-///       loops on "always non-blank, always duration=0" degenerate cases.
+///     - If token is blank: advance ``t`` by ``max(duration, 1)``.
+///     - Otherwise: emit token, advance ``t`` by ``duration`` if > 0, else
+///       keep ``t`` and try again (capped by ``maxSymbolsPerStep``).
 public enum GreedyTDTDecoder {
 
     public struct Output {
         public let tokenIds: [Int]
         public let frameIndices: [Int]
         public let durations: [Int]
+        /// Wall-clock time spent inside ``runner.runDecoderStep()`` +
+        /// ``runner.runJoint()`` plus the argmax + state copies.
+        public let elapsedSeconds: Double
     }
 
     public static func decode(
@@ -28,7 +32,6 @@ public enum GreedyTDTDecoder {
         encoderMask: MLMultiArray,
         runner: ModelRunner
     ) throws -> Output {
-        // encoderHidden shape: [1, T, H]. Extract validFrames from the mask.
         guard encoderHidden.shape.count == 3 else {
             throw ParakeetError.unexpectedOutputShape(
                 name: "encoder_hidden",
@@ -39,8 +42,8 @@ public enum GreedyTDTDecoder {
         let hiddenSize = encoderHidden.shape[2].intValue
         let tMax = encoderHidden.shape[1].intValue
 
-        let maskPtr = UnsafeMutablePointer<Int32>(
-            OpaquePointer(encoderMask.dataPointer)
+        let maskPtr = encoderMask.dataPointer.bindMemory(
+            to: Int32.self, capacity: encoderMask.count
         )
         var validFrames = 0
         for i in 0..<encoderMask.shape.last!.intValue {
@@ -48,51 +51,44 @@ public enum GreedyTDTDecoder {
         }
         validFrames = min(validFrames, tMax)
 
-        let hLayers = runner.decoderHiddenLayers
-        let hSize = runner.decoderHiddenSize
         let blank = runner.blankTokenId
         let durations = runner.durations
         let maxSym = runner.maxSymbolsPerStep
 
-        // Reusable MLMultiArrays for the decoder loop.
-        let hidden = try MLMultiArray(
-            shape: [NSNumber(value: hLayers), 1, NSNumber(value: hSize)],
-            dataType: .float32
-        )
-        let cell = try MLMultiArray(
-            shape: [NSNumber(value: hLayers), 1, NSNumber(value: hSize)],
-            dataType: .float32
-        )
-        let inputIds = try MLMultiArray(
-            shape: [1, 1],
-            dataType: .int32
-        )
-        let encoderFrame = try MLMultiArray(
-            shape: [1, NSNumber(value: hiddenSize)],
-            dataType: .float32
-        )
-        let decoderState = try MLMultiArray(
-            shape: [1, NSNumber(value: hiddenSize)],
-            dataType: .float32
-        )
+        // Persistent buffers owned by the runner. Zero hidden/cell for a
+        // fresh utterance; input_ids starts at blank.
+        let hidden = runner.decoderHidden
+        let cell = runner.decoderCell
+        let inputIds = runner.decoderInputIds
+        let jointEncFrame = runner.jointEncoderFrame
+        let jointDecState = runner.jointDecoderState
         zero(hidden)
         zero(cell)
-
-        let idsPtr = UnsafeMutablePointer<Int32>(OpaquePointer(inputIds.dataPointer))
+        let idsPtr = inputIds.dataPointer
+            .bindMemory(to: Int32.self, capacity: 1)
         idsPtr[0] = Int32(blank)
 
-        let encFramePtr = UnsafeMutablePointer<Float32>(OpaquePointer(encoderFrame.dataPointer))
-        let decStatePtr = UnsafeMutablePointer<Float32>(OpaquePointer(decoderState.dataPointer))
-        let encHiddenPtr = UnsafeMutablePointer<Float32>(OpaquePointer(encoderHidden.dataPointer))
+        let encFramePtr = jointEncFrame.dataPointer
+            .bindMemory(to: Float32.self, capacity: hiddenSize)
+        let decStatePtr = jointDecState.dataPointer
+            .bindMemory(to: Float32.self, capacity: hiddenSize)
+        let encHiddenPtr = encoderHidden.dataPointer
+            .bindMemory(to: Float32.self, capacity: encoderHidden.count)
 
         var tokens = [Int]()
         var frameIdx = [Int]()
         var durationOut = [Int]()
-        var decoderCache: MLMultiArray? = nil
 
+        /// True once we've written a valid ``decoder_hidden[:, -1, :]``
+        /// slice into the joint's persistent ``decoder_state`` buffer. If
+        /// the last emitted token was blank, we can skip rerunning the
+        /// decoder since the state hasn't changed.
+        var decoderStateValid = false
+
+        let start = Date()
         var t = 0
         while t < validFrames {
-            // Copy encoder_hidden[0, t, :] into the encoder_frame buffer.
+            // Copy encoder_hidden[0, t, :] into the joint's encoder_frame.
             memcpy(
                 encFramePtr,
                 encHiddenPtr.advanced(by: t * hiddenSize),
@@ -102,41 +98,38 @@ public enum GreedyTDTDecoder {
             var symbols = 0
             var advanced = false
             while symbols < maxSym {
-                let cached = decoderCache
-                let decHidden: MLMultiArray
-                if cached == nil || idsPtr[0] != Int32(blank) {
-                    let out = try runner.runDecoderStep(
-                        inputIds: inputIds, hidden: hidden, cell: cell
-                    )
-                    decHidden = out.decoderHidden
-                    copyMultiArray(from: out.nextHidden, to: hidden)
-                    copyMultiArray(from: out.nextCell, to: cell)
-                    decoderCache = decHidden
-                } else {
-                    decHidden = cached!
+                if !decoderStateValid || idsPtr[0] != Int32(blank) {
+                    // Scoped so the prediction output (IOSurface-backed on
+                    // ANE / GPU) is released before the next iteration.
+                    try autoreleasepool {
+                        let out = try runner.runDecoderStep()
+                        let decShape = out.decoderHidden.shape.map(\.intValue)
+                        let decU = decShape.count >= 3
+                            ? decShape[decShape.count - 2] : 1
+                        let lastT = decU - 1
+                        let outPtr = out.decoderHidden.dataPointer.bindMemory(
+                            to: Float32.self, capacity: out.decoderHidden.count
+                        )
+                        memcpy(
+                            decStatePtr,
+                            outPtr.advanced(by: lastT * hiddenSize),
+                            hiddenSize * MemoryLayout<Float32>.size
+                        )
+                        copyMultiArray(from: out.nextHidden, to: hidden)
+                        copyMultiArray(from: out.nextCell, to: cell)
+                    }
+                    decoderStateValid = true
                 }
 
-                // decoder_hidden shape: [1, U, hidden]. Take the last time step.
-                let decShape = decHidden.shape.map(\.intValue)
-                let decU = decShape.count >= 3 ? decShape[decShape.count - 2] : 1
-                let lastT = decU - 1
-                let decHiddenPtr = UnsafeMutablePointer<Float32>(
-                    OpaquePointer(decHidden.dataPointer)
-                )
-                memcpy(
-                    decStatePtr,
-                    decHiddenPtr.advanced(by: lastT * hiddenSize),
-                    hiddenSize * MemoryLayout<Float32>.size
-                )
-
-                let jointOut = try runner.runJoint(
-                    encoderFrame: encoderFrame,
-                    decoderState: decoderState
-                )
-                let tokLogits = jointOut.tokenLogits
-                let durLogits = jointOut.durationLogits
-                let tokenId = argmax(tokLogits)
-                let durIdx = argmax(durLogits)
+                // Joint: also autoreleasepool'd so the IOSurface output is
+                // returned to the pool before we loop.
+                let (tokenId, durIdx): (Int, Int) = try autoreleasepool {
+                    let jointOut = try runner.runJoint()
+                    return (
+                        argmax(jointOut.tokenLogits),
+                        argmax(jointOut.durationLogits)
+                    )
+                }
                 let duration = durations[durIdx]
 
                 if tokenId == blank {
@@ -158,11 +151,13 @@ public enum GreedyTDTDecoder {
             }
             if !advanced { t += 1 }
         }
+        let elapsed = Date().timeIntervalSince(start)
 
         return Output(
             tokenIds: tokens,
             frameIndices: frameIdx,
-            durations: durationOut
+            durations: durationOut,
+            elapsedSeconds: elapsed
         )
     }
 
@@ -170,19 +165,14 @@ public enum GreedyTDTDecoder {
 
     @inline(__always)
     static func zero(_ arr: MLMultiArray) {
-        arr.withUnsafeMutableBytes { raw, _ in
-            memset(raw.baseAddress!, 0, raw.count)
-        }
+        let count = arr.count
+        memset(arr.dataPointer, 0, count * MemoryLayout<Float32>.size)
     }
 
     @inline(__always)
     static func copyMultiArray(from src: MLMultiArray, to dst: MLMultiArray) {
-        src.withUnsafeBytes { sBuf in
-            dst.withUnsafeMutableBytes { dBuf, _ in
-                let n = min(sBuf.count, dBuf.count)
-                memcpy(dBuf.baseAddress!, sBuf.baseAddress!, n)
-            }
-        }
+        let bytes = min(src.count, dst.count) * MemoryLayout<Float32>.size
+        memcpy(dst.dataPointer, src.dataPointer, bytes)
     }
 
     @inline(__always)

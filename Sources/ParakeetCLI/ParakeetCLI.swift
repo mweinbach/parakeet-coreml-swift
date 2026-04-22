@@ -107,14 +107,19 @@ struct Transcribe: ParsableCommand {
 
         if showTiming {
             var err = StderrStream()
+            let t = result.timing
             print(
                 """
 
                 ----- timing -----
-                audio:     \(String(format: "%.3f", result.audioDurationSeconds)) s
-                inference: \(String(format: "%.3f", result.inferenceDurationSeconds)) s
-                RTFx:      \(String(format: "%.2fx", result.rtfx))
-                tokens:    \(result.tokenIds.count)
+                audio:      \(String(format: "%7.3f", result.audioDurationSeconds)) s
+                inference:  \(String(format: "%7.3f", result.inferenceDurationSeconds)) s
+                  mel:      \(String(format: "%7.3f", t.melExtract)) s
+                  encoder:  \(String(format: "%7.3f", t.encoder)) s
+                  decode:   \(String(format: "%7.3f", t.decoderLoop)) s   (decoder + joint loop)
+                  detok:    \(String(format: "%7.3f", t.detokenize)) s
+                RTFx:       \(String(format: "%7.2fx", result.rtfx))
+                tokens:     \(result.tokenIds.count)
                 """,
                 to: &err
             )
