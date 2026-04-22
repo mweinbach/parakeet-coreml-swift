@@ -17,14 +17,28 @@ import Foundation
 /// Subsequent launches find the cached compiled bundle and skip the compile
 /// step.
 ///
-/// Usage:
+/// Three convenience entry points, in order of "how little work do I want
+/// to do":
 ///
 /// ```swift
-/// let t = try ParakeetTranscriber(modelsRoot: url)
-/// let transcription = try t.transcribe(audioURL: audio)
-/// print(transcription.text)
+/// // 1. Zero-setup: fetch the default model from HuggingFace + transcribe.
+/// let t = try await ParakeetTranscriber.fromHuggingFace()
+/// let result = try t.transcribe(audioURL: audio)
+///
+/// // 2. Specify a HF repo (useful for pinning / private mirrors).
+/// let t = try await ParakeetTranscriber.fromHuggingFace(
+///     repoId: "mweinbach1/parakeet-tdt-0.6b-v3-coreml",
+///     computeUnits: .gpu
+/// )
+///
+/// // 3. Fully local: point at a directory you staged yourself.
+/// let t = try ParakeetTranscriber(modelsRoot: localURL)
 /// ```
 public final class ParakeetTranscriber {
+
+    /// Default HuggingFace repo used by ``fromHuggingFace()`` when no
+    /// `repoId` is supplied.
+    public static let defaultRepoId = "mweinbach1/parakeet-tdt-0.6b-v3-coreml"
     public let computeUnits: ParakeetComputeUnits
     public let chunkMelFrames: Int    // must match the encoder's traced shape
     public let sampleRate: Int
@@ -242,4 +256,39 @@ public final class ParakeetTranscriber {
     /// Cache directory where compiled `.mlmodelc`s live. Exposed so callers
     /// can clear it if they want to force a recompile or free disk.
     public var compiledCacheDirectory: URL { cacheURL }
+
+    // MARK: - HuggingFace convenience
+
+    /// Download the default model from HuggingFace (or `repoId` if
+    /// supplied) on first call, then construct a fully-ready
+    /// ``ParakeetTranscriber``. Subsequent calls hit the on-disk cache
+    /// and skip the download.
+    ///
+    /// The downloaded `.mlpackage`s live under
+    /// ``ModelDownloader.defaultCacheDirectory()``; the compiled
+    /// `.mlmodelc`s live under ``ModelCache.defaultCacheDirectory()``.
+    /// Both persist across launches.
+    public static func fromHuggingFace(
+        repoId: String = defaultRepoId,
+        branch: String = "main",
+        computeUnits: ParakeetComputeUnits = .ane,
+        chunkMelFrames: Int = 3000,
+        sampleRate: Int = 16_000,
+        decoderWorkers: Int? = nil,
+        progress: ModelDownloader.ProgressHandler? = nil
+    ) async throws -> ParakeetTranscriber {
+        let downloader = ModelDownloader()
+        let modelsRoot = try await downloader.download(
+            repoId: repoId,
+            branch: branch,
+            progress: progress
+        )
+        return try ParakeetTranscriber(
+            modelsRoot: modelsRoot,
+            computeUnits: computeUnits,
+            chunkMelFrames: chunkMelFrames,
+            sampleRate: sampleRate,
+            decoderWorkers: decoderWorkers
+        )
+    }
 }

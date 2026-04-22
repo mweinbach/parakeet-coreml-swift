@@ -3,16 +3,16 @@ import Foundation
 import ParakeetTDT
 
 @main
-struct Parakeet: ParsableCommand {
+struct Parakeet: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "parakeet",
         abstract: "Transcribe audio with Parakeet TDT on Core ML.",
-        subcommands: [Transcribe.self],
+        subcommands: [Transcribe.self, DownloadModels.self],
         defaultSubcommand: Transcribe.self
     )
 }
 
-struct Transcribe: ParsableCommand {
+struct Transcribe: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "transcribe",
         abstract: "Transcribe an audio file."
@@ -25,9 +25,15 @@ struct Transcribe: ParsableCommand {
 
     @Option(
         name: [.short, .customLong("models")],
-        help: "Directory containing encoder.mlpackage, decoder.mlpackage, joint.mlpackage, tokenizer.json."
+        help: "Directory containing encoder.mlpackage, decoder.mlpackage, joint.mlpackage, tokenizer.json. If omitted, models are auto-downloaded from --hf-repo."
     )
-    var models: String
+    var models: String? = nil
+
+    @Option(
+        name: .customLong("hf-repo"),
+        help: "HuggingFace repo to download models from when --models is not set. Default: \(ParakeetTranscriber.defaultRepoId)."
+    )
+    var hfRepo: String = ParakeetTranscriber.defaultRepoId
 
     @Option(
         name: .customLong("compute-units"),
@@ -55,7 +61,7 @@ struct Transcribe: ParsableCommand {
 
     @Option(
         name: .customLong("decoder-workers"),
-        help: "Parallel decode-loop workers. Default: 2 for ANE / GPU / all, 1 for CPU (avoids CPU core contention with the on-CPU encoder)."
+        help: "Parallel decode-loop workers. Default: 4 for GPU / all, 2 for ANE, 1 for CPU (avoids CPU core contention with the on-CPU encoder)."
     )
     var decoderWorkers: Int? = nil
 
@@ -67,7 +73,7 @@ struct Transcribe: ParsableCommand {
         }
     }
 
-    func run() throws {
+    func run() async throws {
         let units: ParakeetComputeUnits = {
             switch computeUnits {
             case "gpu": return .gpu
@@ -77,24 +83,42 @@ struct Transcribe: ParsableCommand {
             }
         }()
 
-        let modelsURL = URL(fileURLWithPath: models, isDirectory: true)
-        let audioURL = URL(fileURLWithPath: audio)
+        var err = StderrStream()
 
-        FileHandle.standardError.write(Data(
-            "Loading models (compute: \(computeUnits))...\n".utf8
-        ))
+        let transcriber: ParakeetTranscriber
         let loadStart = Date()
-        let transcriber = try ParakeetTranscriber(
-            modelsRoot: modelsURL,
-            computeUnits: units,
-            deleteSourceAfterCompile: deleteSourceAfterCompile,
-            decoderWorkers: decoderWorkers
-        )
+        if let localModels = models, !localModels.isEmpty {
+            let modelsURL = URL(fileURLWithPath: localModels, isDirectory: true)
+            print("Loading models from \(modelsURL.path) (compute: \(computeUnits))...", to: &err)
+            transcriber = try ParakeetTranscriber(
+                modelsRoot: modelsURL,
+                computeUnits: units,
+                deleteSourceAfterCompile: deleteSourceAfterCompile,
+                decoderWorkers: decoderWorkers
+            )
+        } else {
+            print("Fetching models from HuggingFace (\(hfRepo)) -- first launch only...", to: &err)
+            transcriber = try await ParakeetTranscriber.fromHuggingFace(
+                repoId: hfRepo,
+                computeUnits: units,
+                decoderWorkers: decoderWorkers,
+                progress: { done, total, name in
+                    let pct = total > 0 ? (Double(done) / Double(total) * 100.0) : 0
+                    let name40 = String(name.prefix(40))
+                    print(
+                        String(
+                            format: "  \r[%5.1f%%] %@",
+                            pct, name40 as CVarArg
+                        ),
+                        to: &err
+                    )
+                }
+            )
+        }
         let loadSecs = Date().timeIntervalSince(loadStart)
-        FileHandle.standardError.write(Data(
-            "Models ready in \(String(format: "%.2f", loadSecs)) s\n".utf8
-        ))
+        print("Models ready in \(String(format: "%.2f", loadSecs)) s", to: &err)
 
+        let audioURL = URL(fileURLWithPath: audio)
         let samples: [Float]
         if let cap = maxSeconds {
             let raw = try AudioLoader.loadMono16k(at: audioURL)
@@ -104,16 +128,16 @@ struct Transcribe: ParsableCommand {
             samples = try AudioLoader.loadMono16k(at: audioURL)
         }
         let seconds = Double(samples.count) / Double(transcriber.sampleRate)
-        FileHandle.standardError.write(Data(
-            "Transcribing \(String(format: "%.2f", seconds)) s of audio...\n".utf8
-        ))
+        print(
+            "Transcribing \(String(format: "%.2f", seconds)) s of audio...",
+            to: &err
+        )
 
         let result = try transcriber.transcribe(samples: samples)
 
         print(result.text)
 
         if showTiming {
-            var err = StderrStream()
             let t = result.timing
             print(
                 """
@@ -134,7 +158,39 @@ struct Transcribe: ParsableCommand {
     }
 }
 
-/// Lightweight stderr writer so we can redirect timing output away from
+struct DownloadModels: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "download",
+        abstract: "Pre-download the Core ML model bundle from HuggingFace into the local cache. Useful for staging a build or running offline later."
+    )
+
+    @Option(
+        name: .customLong("hf-repo"),
+        help: "HuggingFace repo to download."
+    )
+    var hfRepo: String = ParakeetTranscriber.defaultRepoId
+
+    func run() async throws {
+        var err = StderrStream()
+        print("Downloading \(hfRepo) ...", to: &err)
+        let downloader = ModelDownloader()
+        let dir = try await downloader.download(
+            repoId: hfRepo,
+            progress: { done, total, name in
+                let pct = total > 0 ? (Double(done) / Double(total) * 100.0) : 0
+                let name40 = String(name.prefix(40))
+                print(
+                    String(format: "  [%5.1f%%] %@", pct, name40 as CVarArg),
+                    to: &err
+                )
+            }
+        )
+        print("Models at: \(dir.path)", to: &err)
+        print(dir.path)  // stdout: the path, so callers can script around it
+    }
+}
+
+/// Lightweight stderr writer so we can redirect status messages away from
 /// stdout (which carries the transcript).
 private struct StderrStream: TextOutputStream {
     mutating func write(_ string: String) {

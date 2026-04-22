@@ -84,6 +84,7 @@ public enum ParakeetError: Error, CustomStringConvertible, Sendable {
     case unexpectedOutputShape(name: String, got: [Int], expected: String)
     case missingOutput(name: String)
     case fftSetupFailed
+    case downloadFailed(repoId: String, reason: String)
 
     public var description: String {
         switch self {
@@ -103,6 +104,8 @@ public enum ParakeetError: Error, CustomStringConvertible, Sendable {
             return "Missing expected output \"\(name)\" from Core ML prediction"
         case .fftSetupFailed:
             return "Failed to create vDSP FFT setup"
+        case .downloadFailed(let repoId, let reason):
+            return "Failed to download models from \(repoId): \(reason)"
         }
     }
 }
