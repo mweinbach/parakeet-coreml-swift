@@ -57,39 +57,83 @@ at load time without rebuilding the `.mlpackage`.
 
 Same `.mlpackage` artifacts, just different `--compute-units`:
 
-| Target | Inference | RTFx | Encoder | Decode loop |
-|---|---:|---:|---:|---:|
-| CPU | 7.72 s | 135.8× | 5.96 s | 1.45 s |
-| **ANE** | **4.27 s** | **245.5×** | 2.53 s | 1.44 s |
-| GPU | 2.81 s | 373.2× | 1.03 s | 1.46 s |
+| Target | Inference | RTFx | Encoder stage | Decode stage | vs Python |
+|---|---:|---:|---:|---:|---:|
+| CPU | 6.24 s | **168.2×** | 6.18 s | 1.60 s | +21.7% |
+| **ANE** | **2.60 s** | **403.5×** | 2.54 s | 1.38 s | **+64.4%** |
+| **GPU** | **1.66 s** | **633.5×** | 0.77 s | 1.50 s | **+52.9%** |
 
-Reference Python `coremltools` numbers on the same model on the same
-machine: CPU 138.2×, ANE 245.5×, GPU 414.2×. Swift is within ~1% of
-Python on ANE and CPU; GPU has ~10% overhead in how we feed the encoder
-input array, left as a future optimization.
+Python `coremltools` reference on the same model on the same machine:
+CPU 138.2×, ANE 245.5×, GPU 414.2×. **Swift is strictly faster than
+Python on every target.**
+
+Note that the per-stage times add up to more than the total -- that's
+the pipeline doing its job (see below).
 
 ## How the fast path works
 
-The decoder loop makes ~3000 tiny `MLModel.prediction(from:)` calls on a
-17.5-min clip (one per emitted symbol). We keep this cheap by:
+Three optimizations stacked on top of each other:
 
-- **Pre-allocating every input `MLMultiArray` once** (`input_ids`,
-  `hidden`, `cell`, `encoder_frame`, `decoder_state`) and reusing them
-  across every step. The `MLFeatureProvider` handed to Core ML is a
-  custom `FeatureBag` that wraps those arrays and just answers
-  `featureValue(for:)` lookups.
-- **Scoping prediction outputs in `autoreleasepool`**, so the
-  IOSurface-backed output buffers from each prediction are returned to
-  the pool before the next iteration. Without this you exhaust the
-  IOSurface pool in a few seconds.
-- **Argmax via `vDSP_maxvi`** on the raw `MLMultiArray` data pointer.
-- **All per-symbol state as raw `UnsafeMutablePointer`s**; no
-  `[Float]` allocations inside the loop.
+### 1. Pre-allocated input / reused `MLFeatureProvider`
 
-The end-to-end result is a Swift implementation that runs at Core ML's
-native speed on this model -- identical to what you'd get from
-`coremltools` in Python, without any `numpy`, `torch`, or Python
-in the hot path.
+The decoder makes ~3000 tiny `MLModel.prediction(from:)` calls on a
+17.5-min clip -- one per emitted symbol. Each call used to build a fresh
+`MLDictionaryFeatureProvider`, which allocates a Swift dict + bridges
+through `NSDictionary`. Over 3000 calls that was a non-trivial fraction
+of the wall clock.
+
+[`FeatureBag.swift`](Sources/ParakeetTDT/FeatureBag.swift) is a minimal
+custom `MLFeatureProvider` built once per submodule and reused every
+step. The `MLMultiArray`s it wraps (`input_ids`, `hidden`, `cell`,
+`encoder_frame`, `decoder_state`) are also pre-allocated once and
+overwritten in place -- no allocations in the hot loop.
+
+### 2. `autoreleasepool` around each prediction
+
+Core ML's output `MLMultiArray`s come out of a pool of IOSurface-backed
+buffers. If you retain them past the next prediction call (via any stray
+Swift reference), you blow the pool and the process crashes with
+`Failed to allocate memory IOSurface object`. Wrapping each
+`prediction(from:)` call in an `autoreleasepool` guarantees the
+outputs are returned to the pool before the next iteration.
+
+### 3. 3-stage pipeline across chunks
+
+The big one. A 17.5-minute clip is 35 × 30-second chunks, and each chunk
+has three sequential stages on wildly different hardware:
+
+- **mel extraction** (CPU, `vDSP`) -- ~9 ms / chunk
+- **encoder** (ANE / GPU / CPU depending on `computeUnits`) -- 22-170 ms
+- **greedy TDT decode loop** (CPU, LSTM + joint) -- ~40 ms
+
+Running them sequentially per chunk wastes the idle hardware. The ANE
+is doing nothing while the CPU decodes, and the CPU is doing nothing
+while the ANE encodes.
+
+[`Pipeline.swift`](Sources/ParakeetTDT/Pipeline.swift) runs the three
+stages on three dedicated `DispatchQueue`s, with two bounded blocking
+queues connecting them. Chunk N's encoder runs while chunk N+1's mel
+extracts and chunk N-1's decode loop runs -- all on different hardware.
+Total wall time collapses from `sum(stages) * num_chunks` to roughly
+`max(stages) * num_chunks`.
+
+Backpressure (capacity-2 `BlockingQueue`) caps how many encoder outputs
+are in flight at once so we don't accidentally exhaust the IOSurface
+pool under a fast encoder.
+
+## What's left on the table
+
+- **Parallel decode on GPU**: decode is currently the bottleneck on GPU
+  (1.5 s). Two concurrent decode workers would drop it to ~0.75 s and
+  the encoder would become the bottleneck at 0.77 s -- potentially
+  ~1350× RTFx on GPU. Requires a worker pool with per-worker buffer
+  sets; a reasonable v2.
+- **IOSurface-backed encoder input**: ~5% win on GPU by avoiding a
+  memcpy onto GPU-visible memory. Not done because the pipeline already
+  hides the encoder stage behind the decoder on GPU.
+- **vDSP_zvmags + vDSP_mmul in mel**: would probably cut mel time ~50%,
+  but mel isn't on the critical path for any `computeUnits` -- the
+  pipeline parks it behind the encoder.
 
 ## CLI
 
