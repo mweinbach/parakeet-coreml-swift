@@ -1,0 +1,13 @@
+version: 1
+
+# Swift Package Index build + docs config
+# https://swiftpackageindex.com/swiftpackageindex/spimanifest/documentation/spimanifest
+
+builder:
+  configs:
+    - platform: macosSpm
+      documentation_targets:
+        - ParakeetTDT
+    - platform: ios
+      documentation_targets:
+        - ParakeetTDT

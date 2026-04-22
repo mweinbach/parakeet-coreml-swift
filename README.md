@@ -1,5 +1,10 @@
 # parakeet-coreml-swift
 
+[![Swift](https://img.shields.io/badge/Swift-5.10%20%7C%206.0-orange.svg?style=flat)](https://swift.org)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%2014%2B%20%7C%20iOS%2017%2B-blue.svg?style=flat)](https://developer.apple.com)
+[![SwiftPM](https://img.shields.io/badge/SwiftPM-compatible-brightgreen.svg?style=flat)](https://swift.org/package-manager/)
+[![License](https://img.shields.io/badge/license-Apache--2.0-lightgray.svg?style=flat)](LICENSE)
+
 On-device speech-to-text on Apple silicon. Swift wrapper around NVIDIA's
 **Parakeet TDT 0.6B v3** compiled to Core ML, tuned so it's **3× faster
 than running the same `.mlpackage` from Python** on the GPU.
@@ -56,11 +61,35 @@ swift run -c release parakeet download
 
 ## Add to your project
 
-In `Package.swift`:
+### Xcode (iOS / macOS app)
+
+1. In Xcode, open **File > Add Package Dependencies...**
+2. Paste the repo URL:
+   `https://github.com/mweinbach/parakeet-coreml-swift`
+3. Pick the **Up to Next Major Version** rule on `0.1.0`.
+4. When Xcode shows the products list, select the **`ParakeetTDT`**
+   library (leave the `parakeet` CLI executable unchecked unless you
+   want the command-line tool bundled) and add it to your app target.
+5. In any Swift file: `import ParakeetTDT` and use
+   `ParakeetTranscriber.fromHuggingFace(...)` -- it's async, so call it
+   from an async context (a `Task`, `@MainActor` function, or SwiftUI
+   `.task { }`).
+
+Xcode's package resolver will pull this package and its single
+dependency (`swift-argument-parser`) automatically.
+
+The library uses `Foundation`, `CoreML`, `AVFoundation`, and
+`Accelerate` -- all ship with every Apple OS, no extra frameworks to
+link.
+
+### Swift Package Manager (command line or non-Xcode Swift project)
+
+In your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/mweinbach/parakeet-coreml-swift", from: "0.1.0"),
+    .package(url: "https://github.com/mweinbach/parakeet-coreml-swift",
+             from: "0.1.0"),
 ]
 
 // Target:
@@ -71,6 +100,19 @@ dependencies: [
     ]
 )
 ```
+
+### App-sandbox note (macOS / iOS)
+
+`ParakeetTranscriber.fromHuggingFace(...)` downloads a ~450 MB model
+to `~/Library/Caches/...` on first run, so if your app runs inside the
+App Sandbox:
+
+- macOS: outgoing connections work by default once you enable the
+  **Outgoing Connections (Client)** App Sandbox capability.
+- iOS: HTTPS to `huggingface.co` works without any Info.plist entry.
+- Either platform: if you ship models inside the app bundle instead of
+  auto-downloading, use `ParakeetTranscriber(modelsRoot:)` directly
+  and point it at your `Bundle.main.resourceURL`.
 
 ## Full API
 
