@@ -18,6 +18,13 @@ import Foundation
 /// collapses to roughly ``max(stage_time) * num_chunks``.
 enum Pipeline {
 
+    /// One fixed-length slice of audio, plus how much of it is real: the last
+    /// chunk of an utterance is zero-padded up to the encoder's traced length.
+    struct Chunk {
+        var samples: [Float]
+        var validSamples: Int
+    }
+
     struct Result {
         var tokens: [Int]
         var frames: [Int]
@@ -28,7 +35,7 @@ enum Pipeline {
     }
 
     static func run(
-        chunks: [[Float]],
+        chunks: [Chunk],
         featureExtractor: MelFeatureExtractor,
         runner: ModelRunner
     ) throws -> Result {
@@ -53,7 +60,10 @@ enum Pipeline {
             for (i, chunk) in chunks.enumerated() {
                 if globalError.hasError { break }
                 let t0 = Date()
-                let features = featureExtractor.extract(from: chunk)
+                let features = featureExtractor.extract(
+                    from: chunk.samples,
+                    validSamples: chunk.validSamples
+                )
                 melTotal.add(Date().timeIntervalSince(t0))
                 melQueue.put(MelItem(index: i, features: features))
             }
