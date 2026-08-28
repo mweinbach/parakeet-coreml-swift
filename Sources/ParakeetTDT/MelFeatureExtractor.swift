@@ -95,7 +95,14 @@ public final class MelFeatureExtractor {
         public var numFrames: Int { mel.count }
     }
 
-    public func extract(from waveform: [Float]) -> Features {
+    /// - Parameter validSamples: how many leading samples of `waveform` are real
+    ///   audio, when the caller has zero-padded it to a fixed length. Defaults to
+    ///   the whole waveform. Normalisation statistics and the attention mask are
+    ///   computed over the valid region only -- including the padding makes the
+    ///   per-bin mean and standard deviation of a short utterance in a long chunk
+    ///   describe the silence rather than the speech, and the encoder then sees
+    ///   features that decode to nothing.
+    public func extract(from waveform: [Float], validSamples: Int? = nil) -> Features {
         precondition(waveform.count > 0, "waveform must be non-empty")
 
         // --- Step 1: preemphasis ---
@@ -124,6 +131,13 @@ public final class MelFeatureExtractor {
         if numFrames <= 0 {
             return Features(mel: [], attentionMask: [])
         }
+        // Frames covering real audio. Same arithmetic as `numFrames` above, applied
+        // to the unpadded length: with center=True a signal of length L yields
+        // L / hop + 1 frames.
+        let validSampleCount = min(validSamples ?? waveform.count, waveform.count)
+        let validFrames = validSampleCount <= 0
+            ? 0
+            : min(numFrames, validSampleCount / hopLength + 1)
 
         // Working buffers reused across frames.
         var frameBuf = [Float](repeating: 0, count: nFFT)
@@ -215,11 +229,12 @@ public final class MelFeatureExtractor {
             logMelFrames[t] = melRow
         }
 
-        // Per-mel-bin normalization over time.
+        // Per-mel-bin normalization over time, across the valid frames only.
         var mean = [Float](repeating: 0, count: numMelFilters)
         var std = [Float](repeating: 0, count: numMelFilters)
-        let nT = Float(numFrames)
-        for t in 0..<numFrames {
+        let statFrames = max(validFrames, 1)
+        let nT = Float(statFrames)
+        for t in 0..<statFrames {
             for i in 0..<numMelFilters {
                 mean[i] += logMelFrames[t][i]
             }
@@ -227,7 +242,7 @@ public final class MelFeatureExtractor {
         for i in 0..<numMelFilters { mean[i] /= nT }
         // HF uses ``(len - 1)`` denominator for variance (Bessel's correction).
         let denom = max(nT - 1, 1)
-        for t in 0..<numFrames {
+        for t in 0..<statFrames {
             for i in 0..<numMelFilters {
                 let d = logMelFrames[t][i] - mean[i]
                 std[i] += d * d
@@ -242,7 +257,7 @@ public final class MelFeatureExtractor {
             }
         }
 
-        let mask = [Int32](repeating: 1, count: numFrames)
+        let mask = (0..<numFrames).map { $0 < validFrames ? Int32(1) : Int32(0) }
         return Features(mel: normalized, attentionMask: mask)
     }
 }

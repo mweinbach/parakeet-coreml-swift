@@ -173,18 +173,19 @@ public final class ParakeetTranscriber {
         let chunkSamples = chunkMelFrames * featureExtractor.hopLength
 
         // --- Slice audio into fixed-length chunks up front ---
-        var chunks: [[Float]] = []
+        var chunks: [Pipeline.Chunk] = []
         do {
             var cursor = 0
             while cursor < samples.count {
                 let end = min(cursor + chunkSamples, samples.count)
                 var chunk = Array(samples[cursor..<end])
+                let valid = chunk.count
                 if chunk.count < chunkSamples {
                     chunk.append(
                         contentsOf: [Float](repeating: 0, count: chunkSamples - chunk.count)
                     )
                 }
-                chunks.append(chunk)
+                chunks.append(Pipeline.Chunk(samples: chunk, validSamples: valid))
                 cursor += chunkSamples
             }
         }
